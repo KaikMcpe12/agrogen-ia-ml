@@ -179,18 +179,36 @@ export PREPROCESSOR_PATH=models/rf_v1.0_preprocessor.pkl  # default
 export MODEL_CARD_PATH=models/model_card.json             # default
 ```
 
-### 3. Treinar o modelo (cold start)
+### 3. Treinar o modelo
 
-Execute uma vez antes de rodar o servidor pela primeira vez:
+Execute uma vez antes de rodar o servidor pela primeira vez.
+
+#### Com dataset sintético (cold start)
 
 ```bash
-# Gera o dataset sintético (cold_start_v1.csv)
+# Gera o dataset sintético (cold_start_v1.csv) — 1.300 registros calibrados
 python data/synthetic_generator.py
 
 # Treina o Random Forest com GridSearchCV (~4 minutos)
 # Salva os artefatos em models/
-python src/training.py
+PYTHONPATH=. python src/training.py
 ```
+
+#### Com seu próprio CSV de inseminações
+
+Se você tiver um CSV com dados reais de inseminações, use o conversor antes de treinar:
+
+```bash
+# Converte e mescla com dados sintéticos (garante qualidade do modelo)
+python data/converter.py --input /caminho/para/seu_dataset.csv
+
+# Treina normalmente — usa o cold_start_v1.csv gerado pelo converter
+PYTHONPATH=. python src/training.py
+```
+
+O conversor resolve automaticamente diferenças de formato (maiúsculas, separadores, nomes de colunas) e preenche features ausentes com defaults calibrados. O modelo resultante usa dados reais onde disponíveis e sintéticos para cobrir o restante.
+
+> **Formato mínimo do CSV:** colunas `especie`, `raca_femea`, `condicao_corporal`, `num_partos_anteriores`, `intervalo_pos_parto_dias`, `dias_desde_ultima_ins`, `tipo_inseminacao`, `protocolo_hormonal`, `temperatura_ambiente_c`, `estacao` e `resultado` (`Prenha` ou `Nao_Prenha`). Demais colunas ML ausentes são preenchidas com defaults por espécie.
 
 Artefatos gerados em `models/`:
 
@@ -222,17 +240,25 @@ WARNING: Modelo não encontrado. Execute 'python src/training.py'.
 
 ## 🐳 Rodando com Docker
 
-### Build e execução simples
+O Dockerfile tem **duas formas de uso** — escolha a que melhor se adapta ao seu fluxo:
+
+---
+
+### Opção A — Volume externo (padrão, mais rápida)
+
+O modelo é treinado localmente e montado como volume em runtime. O `docker build` é rápido (~2 min) porque não treina.
 
 ```bash
-# 1. Treine o modelo localmente primeiro
-python data/synthetic_generator.py
+# 1. Treine localmente (uma vez)
+PYTHONPATH=. python data/synthetic_generator.py
 PYTHONPATH=. python src/training.py
+# ou com CSV real:
+# python data/converter.py --input meu_dataset.csv && PYTHONPATH=. python src/training.py
 
-# 2. Build da imagem
+# 2. Build da imagem (target padrão — sem modelo embutido)
 docker build -t agrogen-ia-ml .
 
-# 3. Run com volume para os modelos
+# 3. Run montando a pasta models como volume
 docker run -d \
   --name agrogen-ia-ml \
   -p 8001:8001 \
@@ -241,10 +267,45 @@ docker run -d \
   agrogen-ia-ml
 ```
 
+**Vantagem:** build rápido, fácil de atualizar o modelo sem rebuildar a imagem.
+
+---
+
+### Opção B — Modelo embutido na imagem (recomendado para deploy)
+
+O modelo é **treinado durante o `docker build`** e fica gravado dentro da imagem. Não precisa de volume externo. Ideal para hospedar em Render, Railway, Fly.io etc.
+
+```bash
+# Build com modelo sintético embutido (~6 minutos total)
+docker build --target trained -t agrogen-ia-ml:trained .
+
+# Run sem volume — modelo já está na imagem
+docker run -d \
+  --name agrogen-ia-ml \
+  -p 8001:8001 \
+  -e BACKEND_AUTH_SECRET=seu-segredo \
+  agrogen-ia-ml:trained
+```
+
+#### Embutir com seu CSV real
+
+```bash
+# 1. Copie o CSV para dentro da pasta data/ com o nome dataset_real.csv
+cp /caminho/para/seu_dataset.csv data/dataset_real.csv
+
+# 2. Build — o conversor é chamado automaticamente se data/dataset_real.csv existir
+docker build --target trained -t agrogen-ia-ml:trained .
+
+# 3. Remova o CSV da pasta após o build (opcional)
+rm data/dataset_real.csv
+```
+
+---
+
 ### Com docker-compose
 
 ```bash
-# Sobe o serviço
+# Sobe o serviço (Opção A, com volume)
 docker compose up -d
 
 # Verifica os logs
