@@ -1,0 +1,22 @@
+services:
+  agrogen-ia-ml:
+    build: .
+    image: agrogen-ia-ml:latest
+    container_name: agrogen-ia-ml
+    ports:
+      - "8001:8001"
+    environment:
+      - BACKEND_AUTH_SECRET=${BACKEND_AUTH_SECRET:-dev-secret}
+      - MODEL_PATH=/app/models/rf_v1.0.pkl
+      - PREPROCESSOR_PATH=/app/models/rf_v1.0_preprocessor.pkl
+      - MODEL_CARD_PATH=/app/models/model_card.json
+    volumes:
+      - ./models:/app/models:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
