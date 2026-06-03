@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: agrogen-ia-ml
+    runtime: python
+    rootDir: agrogen-ia-ml
+    region: oregon          # região gratuita disponível
+    plan: free
+
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python data/synthetic_generator.py &&
+      PYTHONPATH=. python src/training.py
+
+    startCommand: PYTHONPATH=. uvicorn src.serve:app --host 0.0.0.0 --port $PORT
+
+    envVars:
+      - key: BACKEND_AUTH_SECRET
+        generateValue: true          # Render gera um valor aleatório seguro
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: MODEL_PATH
+        value: models/rf_v1.0.pkl
+      - key: PREPROCESSOR_PATH
+        value: models/rf_v1.0_preprocessor.pkl
+      - key: MODEL_CARD_PATH
+        value: models/model_card.json
+
+    healthCheckPath: /health
