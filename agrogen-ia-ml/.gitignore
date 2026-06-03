@@ -1,0 +1,9 @@
+models/*.pkl
+models/*.json
+data/cold_start_v1.csv
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
+.env

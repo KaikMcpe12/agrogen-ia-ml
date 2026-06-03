@@ -1,0 +1,11 @@
+models/
+data/
+notebooks/
+.pytest_cache/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+tests/
+README.md
