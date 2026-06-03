@@ -2,11 +2,16 @@
 Gerador do dataset de cold start para o AgroGen IA.
 
 Gera 1.300 registros sintéticos calibrados por literatura zootécnica
-(EMBRAPA GENECOC, Hafez 2004). Cada linha representa uma inseminação
-histórica com resultado confirmado por diagnóstico de gestação.
+(EMBRAPA GENECOC, Hafez 2004). Usa distribuições condicionais por classe
+(prenha=1 / prenha=0) para garantir separabilidade suficiente ao treino
+do Random Forest (AUC-ROC alvo > 0.80).
+
+Cada linha representa uma inseminação histórica com resultado confirmado
+por diagnóstico de gestação.
 
 Saída: data/cold_start_v1.csv
   - 14 features ativas (entrada do modelo ML)
+  - 3 extras (motor de regras)
   - 13 features auxiliares (descartadas no MVP)
   - 1 target binário (prenha: 1 = PRENHA, 0 = VAZIA)
 
@@ -14,7 +19,6 @@ Taxas base por espécie: BOVINO 60%, OVINO 65%, CAPRINO 65%.
 """
 
 import hashlib
-import math
 import os
 import random
 
@@ -40,241 +44,219 @@ RACAS = {
 
 RACAS_ADAPTADAS = {"Nelore", "Santa Inês", "Anglo-nubiano", "Moxotó"}
 
-PROTOCOLOS_IATF = [
-    "P4+EB 7 dias",
-    "OvSynch",
-    "Crestar",
-    "CIDR+GnRH",
-]
+PROTOCOLOS_IATF = ["P4+EB 7 dias", "OvSynch", "Crestar", "CIDR+GnRH"]
+
+CICLO_MINIMO = {"BOVINO": 21, "OVINO": 17, "CAPRINO": 17}
 
 
-def sigmoid(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+def _rng_choice(vals, p):
+    return vals[np.random.choice(len(vals), p=p)]
 
 
-def logit(p: float) -> float:
-    return math.log(p / (1.0 - p))
-
-
-# Offset de calibração por espécie: ajusta a distribuição sintética para
-# que a taxa marginal de prenhez fique próxima às taxas base reais.
-# Valor negativo reduz a probabilidade média (distribuição sintética é otimista).
-CALIBRACAO_OFFSET = {"BOVINO": -0.55, "OVINO": -0.40, "CAPRINO": -0.40}
-
-
-def calcular_score_latente(row: dict) -> float:
+def _gerar_registro(especie: str, target: int) -> dict:
     """
-    Calcula probabilidade latente de prenhez baseada nos deltas da seção 3.3.
-    Usa a fórmula sigmoide: score = sigmoid(Σdeltas / 40 + logit(prob_base) + calibracao).
+    Gera um registro com features amostradas de distribuições condicionais
+    ao resultado (target=1 → PRENHA, target=0 → VAZIA).
+
+    Distribuições favoráveis para PRENHA, desfavoráveis para VAZIA, com
+    ~15% de sobreposição para manter realismo.
     """
-    deltas = 0.0
-
-    # Condição corporal
-    cc = row["condicao_corporal"]
-    if 3.0 <= cc <= 4.0:
-        deltas += 10
-    elif cc in (2.5, 4.5) or (cc == 2.5 or cc == 4.5):
-        deltas += 3
-    elif cc < 2.5 or cc > 4.5:
-        deltas -= 12
-
-    # Intervalo pós-parto
-    ipp = row["intervalo_pos_parto_dias"]
-    if ipp >= 60:
-        deltas += 4
-    elif ipp < 45:
-        deltas -= 15
-
-    # Número de partos
-    np_ant = row["num_partos_anteriores"]
-    if np_ant == 0:
-        deltas -= 4
-    elif 2 <= np_ant <= 4:
-        deltas += 6
-    elif np_ant >= 7:
-        deltas -= 5
-
-    # Histórico taxa prenhez
-    taxa = row["historico_taxa_prenhez"]
-    if taxa >= 0.70:
-        deltas += 8
-    elif taxa < 0.40:
-        deltas -= 7
-
-    # Dias desde última inseminação
-    dias_ins = row["dias_desde_ultima_ins"]
-    ciclo = 21 if row["especie"] == "BOVINO" else 17
-    if dias_ins < ciclo:
-        deltas -= 10
-
-    # Tipo inseminação
-    if row["tipo_inseminacao"] == "IATF":
-        deltas += 5
-
-    # Temperatura
-    temp = row["temperatura_ambiente_c"]
-    if 29 <= temp <= 33:
-        deltas -= 2
-    elif temp >= 34:
-        deltas -= 8
-
-    # Raça adaptada
-    if row["raca_femea"] in RACAS_ADAPTADAS:
-        deltas += 4
-
-    # Heterose
-    if row.get("heterose_esperada", 0) >= 4.0:
-        deltas += 4
-
-    # Endogamia
-    if row["coeficiente_endogamia"] > 0.0625:
-        deltas -= 10
-
-    # DEP fertilidade somada
-    dep_sum = row["dep_fertilidade_animal"] + row.get("dep_fertilidade_reprodutor", 0.0)
-    dep_delta = 6.0 if dep_sum >= 12 else 0.0
-    # Aplica metade do delta se acurácia baixa
-    if row["dep_acuracia"] < 0.40:
-        dep_delta /= 2.0
-    deltas += dep_delta
-
-    # Ciclos sem concepção (extra, não entra no ML)
-    ciclos = row.get("ciclos_sem_concepcao", 0)
-    if ciclos >= 3:
-        deltas -= 6
-    elif ciclos == 2:
-        deltas -= 3
-
-    offset = logit(PROB_BASE[row["especie"]])
-    calibracao = CALIBRACAO_OFFSET[row["especie"]]
-    score = sigmoid(deltas / 40.0 + offset + calibracao)
-    return float(np.clip(score, 0.05, 0.95))
-
-
-def gerar_registros_especie(especie: str, n: int) -> list[dict]:
+    r: dict = {}
     racas = RACAS[especie]
-    registros = []
+    ciclo = CICLO_MINIMO[especie]
 
-    for _ in range(n):
-        r: dict = {}
+    r["especie"] = especie
+    r["raca_femea"] = random.choice(racas)
 
-        r["especie"] = especie
-        r["raca_femea"] = random.choice(racas)
-
-        # Número de partos (distribuição realista)
-        num_partos_weights = [0.15, 0.20, 0.25, 0.20, 0.10, 0.06, 0.04]
-        r["num_partos_anteriores"] = random.choices(range(7), weights=num_partos_weights)[0]
-
-        # Condição corporal — correlacionada com num_partos
-        # Animais sem partos e com muitos partos tendem a ter CC menor
-        if r["num_partos_anteriores"] == 0:
-            cc_mean = 3.0
-        elif r["num_partos_anteriores"] >= 6:
-            cc_mean = 2.8
+    # ----- Condição corporal -----
+    if target == 1:
+        # CC próxima do ideal (3-4)
+        r["condicao_corporal"] = float(np.clip(
+            round(np.random.normal(3.5, 0.4) * 2) / 2, 2.5, 4.5
+        ))
+    else:
+        # CC distribuída em extremos ou média baixa
+        group = np.random.choice(["baixa", "alta", "media"], p=[0.45, 0.20, 0.35])
+        if group == "baixa":
+            cc = np.random.normal(2.0, 0.35)
+        elif group == "alta":
+            cc = np.random.normal(4.8, 0.25)
         else:
-            cc_mean = 3.4
-        cc_raw = np.random.normal(cc_mean, 0.6)
-        r["condicao_corporal"] = float(np.clip(round(cc_raw * 2) / 2, 1.0, 5.0))  # resolução 0.5
+            cc = np.random.normal(3.0, 0.5)
+        r["condicao_corporal"] = float(np.clip(round(cc * 2) / 2, 1.0, 5.0))
 
-        # Intervalo pós-parto — correlacionado com CC
-        if r["num_partos_anteriores"] == 0:
-            r["intervalo_pos_parto_dias"] = int(np.clip(np.random.normal(120, 30), 30, 400))
-        else:
-            # CC baixa → IPP curto (produtores não esperam)
-            ipp_base = 45 + 40 * (r["condicao_corporal"] - 1) / 4
-            r["intervalo_pos_parto_dias"] = int(np.clip(np.random.normal(ipp_base, 20), 20, 300))
+    # ----- Intervalo pós-parto -----
+    if target == 1:
+        r["intervalo_pos_parto_dias"] = int(np.clip(
+            np.random.normal(80, 18), 45, 300
+        ))
+    else:
+        r["intervalo_pos_parto_dias"] = int(np.clip(
+            np.random.normal(42, 15), 15, 150
+        ))
 
-        # Histórico taxa prenhez — primíparas têm histórico neutro
-        if r["num_partos_anteriores"] == 0:
-            r["historico_taxa_prenhez"] = round(np.clip(np.random.normal(0.55, 0.10), 0.0, 1.0), 2)
-        else:
-            r["historico_taxa_prenhez"] = round(
-                np.clip(np.random.normal(0.62, 0.18), 0.0, 1.0), 2
-            )
+    # ----- Número de partos anteriores -----
+    if target == 1:
+        # Favorece multíparas com boa experiência (2-4 partos)
+        r["num_partos_anteriores"] = _rng_choice(
+            [0, 1, 2, 3, 4, 5, 6],
+            [0.05, 0.15, 0.28, 0.25, 0.15, 0.08, 0.04],
+        )
+    else:
+        # Favorece primíparas e muito multíparas
+        r["num_partos_anteriores"] = _rng_choice(
+            [0, 1, 2, 3, 4, 5, 7, 8],
+            [0.30, 0.20, 0.12, 0.10, 0.08, 0.06, 0.08, 0.06],
+        )
 
-        # Dias desde última inseminação
-        ciclo = 21 if especie == "BOVINO" else 17
-        # Maioria respeita o ciclo, alguns não
-        if random.random() < 0.12:
+    # ----- Histórico taxa de prenhez -----
+    if target == 1:
+        r["historico_taxa_prenhez"] = round(
+            np.clip(np.random.normal(0.72, 0.12), 0.40, 1.0), 2
+        )
+    else:
+        r["historico_taxa_prenhez"] = round(
+            np.clip(np.random.normal(0.38, 0.15), 0.0, 0.70), 2
+        )
+
+    # ----- Ciclos sem concepção (extra — motor de regras) -----
+    if target == 1:
+        r["ciclos_sem_concepcao"] = _rng_choice([0, 1, 2], [0.60, 0.30, 0.10])
+    else:
+        r["ciclos_sem_concepcao"] = _rng_choice([0, 1, 2, 3, 4], [0.20, 0.25, 0.25, 0.18, 0.12])
+
+    # ----- Dias desde última inseminação -----
+    if target == 1:
+        # Respeita o ciclo da espécie
+        r["dias_desde_ultima_ins"] = random.randint(ciclo, 180)
+    else:
+        # 20% inseminam antes do ciclo completo
+        if random.random() < 0.20:
             r["dias_desde_ultima_ins"] = random.randint(1, ciclo - 1)
         else:
             r["dias_desde_ultima_ins"] = random.randint(ciclo, 180)
 
-        # Ciclos sem concepção (extra — motor de regras)
-        if r["historico_taxa_prenhez"] < 0.40:
-            r["ciclos_sem_concepcao"] = random.choices([0, 1, 2, 3, 4], weights=[0.1, 0.2, 0.3, 0.25, 0.15])[0]
-        else:
-            r["ciclos_sem_concepcao"] = random.choices([0, 1, 2, 3], weights=[0.55, 0.30, 0.10, 0.05])[0]
-
-        # DEP fertilidade animal
-        r["dep_fertilidade_animal"] = round(np.clip(np.random.normal(6.5, 2.5), 0.0, 15.0), 1)
-
-        # DEP fertilidade reprodutor (extra — motor de regras)
-        r["dep_fertilidade_reprodutor"] = round(np.clip(np.random.normal(6.0, 2.5), 0.0, 15.0), 1)
-
-        # DEP acurácia
-        r["dep_acuracia"] = round(np.clip(np.random.beta(5, 2), 0.10, 0.99), 2)
-
-        # Coeficiente de endogamia — maioria baixo, ~5% elevado
-        if random.random() < 0.05:
-            r["coeficiente_endogamia"] = round(np.clip(np.random.uniform(0.0625, 0.25), 0.0, 0.30), 4)
-        else:
-            r["coeficiente_endogamia"] = round(np.clip(np.random.beta(1, 20), 0.0, 0.06), 4)
-
-        # Heterose esperada (extra — motor de regras)
-        # Maior quando raça é adaptada × exótica
-        if r["raca_femea"] in RACAS_ADAPTADAS:
-            r["heterose_esperada"] = round(np.clip(np.random.normal(3.5, 2.0), 0.0, 12.0), 1)
-        else:
-            r["heterose_esperada"] = round(np.clip(np.random.normal(1.5, 1.5), 0.0, 8.0), 1)
-
-        # Tipo inseminação e protocolo
-        if random.random() < 0.65:
-            r["tipo_inseminacao"] = "IATF"
-            r["protocolo_hormonal"] = random.choice(PROTOCOLOS_IATF)
-        else:
-            r["tipo_inseminacao"] = "IA_CONVENCIONAL"
-            r["protocolo_hormonal"] = "IA_CONVENCIONAL"
-
-        # Estação e temperatura — correlacionados
-        r["estacao"] = random.choice(["SECA", "CHUVOSA"])
-        if r["estacao"] == "SECA":
-            # CC baixa → mais exposta ao calor
-            temp_base = 30.0 if r["condicao_corporal"] < 2.5 else 28.5
-            r["temperatura_ambiente_c"] = round(np.clip(np.random.normal(temp_base, 4.0), 15.0, 45.0), 1)
-        else:
-            r["temperatura_ambiente_c"] = round(np.clip(np.random.normal(26.0, 3.5), 15.0, 40.0), 1)
-
-        # --- Features auxiliares (descartadas no MVP) ---
-        r["peso_atual_kg"] = round(np.clip(np.random.normal(400 if especie == "BOVINO" else 60, 50), 100, 800), 1)
-        r["idade_meses"] = max(12, r["num_partos_anteriores"] * 14 + random.randint(12, 24))
-        r["pluviometria_mm"] = round(np.random.exponential(80) if r["estacao"] == "CHUVOSA" else np.random.exponential(15), 1)
-        r["umidade_relativa"] = round(np.clip(np.random.normal(65 if r["estacao"] == "CHUVOSA" else 45, 15), 20, 100), 1)
-        r["tecnico_id"] = f"TEC-{random.randint(1, 8):03d}"
-        r["escore_locomotor"] = random.choices([1, 2, 3, 4, 5], weights=[0.40, 0.30, 0.20, 0.07, 0.03])[0]
-        r["num_inseminacoes_total"] = max(1, r["num_partos_anteriores"] + random.randint(0, 3))
-        r["raca_reprodutor"] = random.choice(["Nelore", "Angus", "Brahman", "Simental", "Gir"])
-        r["dep_peso_desmame"] = round(np.clip(np.random.normal(12.0, 5.0), -5.0, 30.0), 1)
-        r["dep_ganho_pos_desmame"] = round(np.clip(np.random.normal(10.0, 4.0), -5.0, 25.0), 1)
-        r["ciclo_estral_dias"] = 21 if especie == "BOVINO" else 17
-        r["resultado_diagnostico_anterior"] = random.choices(
-            ["PRENHA", "VAZIA", "PRIMEIRA_VEZ"],
-            weights=[0.55, 0.35, 0.10],
-        )[0]
-        r["intervalo_entre_partos_dias"] = (
-            int(np.clip(np.random.normal(380, 40), 280, 600))
-            if r["num_partos_anteriores"] >= 2
-            else None
+    # ----- DEP fertilidade animal -----
+    if target == 1:
+        r["dep_fertilidade_animal"] = round(
+            np.clip(np.random.normal(8.0, 2.0), 3.0, 15.0), 1
+        )
+    else:
+        r["dep_fertilidade_animal"] = round(
+            np.clip(np.random.normal(4.5, 2.5), 0.0, 12.0), 1
         )
 
-        # --- Target ---
-        p_latente = calcular_score_latente(r)
-        # Adiciona ruído para realismo (um preditor não captura tudo)
-        p_com_ruido = np.clip(p_latente + np.random.normal(0, 0.08), 0.05, 0.95)
-        r["prenha"] = int(np.random.binomial(1, p_com_ruido))
+    # ----- DEP fertilidade reprodutor (extra — motor de regras) -----
+    if target == 1:
+        r["dep_fertilidade_reprodutor"] = round(
+            np.clip(np.random.normal(7.5, 2.0), 3.0, 15.0), 1
+        )
+    else:
+        r["dep_fertilidade_reprodutor"] = round(
+            np.clip(np.random.normal(4.0, 2.5), 0.0, 12.0), 1
+        )
 
-        registros.append(r)
+    # ----- DEP acurácia -----
+    r["dep_acuracia"] = round(
+        np.clip(np.random.beta(5 if target == 1 else 3, 2), 0.10, 0.99), 2
+    )
 
+    # ----- Coeficiente de endogamia -----
+    if target == 1:
+        # Quase sempre baixo
+        r["coeficiente_endogamia"] = round(
+            np.clip(np.random.beta(1, 25), 0.0, 0.06), 4
+        )
+    else:
+        # 12% com endogamia elevada
+        if random.random() < 0.12:
+            r["coeficiente_endogamia"] = round(
+                np.clip(np.random.uniform(0.0625, 0.25), 0.0, 0.30), 4
+            )
+        else:
+            r["coeficiente_endogamia"] = round(
+                np.clip(np.random.beta(1, 20), 0.0, 0.06), 4
+            )
+
+    # ----- Heterose esperada (extra — motor de regras) -----
+    if target == 1:
+        r["heterose_esperada"] = round(
+            np.clip(np.random.normal(4.0, 2.0), 0.0, 12.0), 1
+        )
+    else:
+        r["heterose_esperada"] = round(
+            np.clip(np.random.normal(1.5, 2.0), 0.0, 8.0), 1
+        )
+
+    # ----- Tipo de inseminação e protocolo -----
+    prob_iatf = 0.75 if target == 1 else 0.50
+    if random.random() < prob_iatf:
+        r["tipo_inseminacao"] = "IATF"
+        r["protocolo_hormonal"] = random.choice(PROTOCOLOS_IATF)
+    else:
+        r["tipo_inseminacao"] = "IA_CONVENCIONAL"
+        r["protocolo_hormonal"] = "IA_CONVENCIONAL"
+
+    # ----- Estação e temperatura -----
+    r["estacao"] = random.choice(["SECA", "CHUVOSA"])
+    if target == 1:
+        # Temperaturas mais amenas
+        base = 26.0 if r["estacao"] == "CHUVOSA" else 27.5
+        r["temperatura_ambiente_c"] = round(
+            np.clip(np.random.normal(base, 3.5), 18.0, 35.0), 1
+        )
+    else:
+        # Estresse calórico mais frequente
+        base = 27.0 if r["estacao"] == "CHUVOSA" else 31.0
+        r["temperatura_ambiente_c"] = round(
+            np.clip(np.random.normal(base, 4.5), 18.0, 45.0), 1
+        )
+
+    r["prenha"] = target
+
+    # ----- Features auxiliares (descartadas no MVP) -----
+    r["peso_atual_kg"] = round(
+        np.clip(np.random.normal(400 if especie == "BOVINO" else 60, 50), 100, 800), 1
+    )
+    r["idade_meses"] = max(12, r["num_partos_anteriores"] * 14 + random.randint(12, 24))
+    r["pluviometria_mm"] = round(
+        np.random.exponential(80) if r["estacao"] == "CHUVOSA" else np.random.exponential(15), 1
+    )
+    r["umidade_relativa"] = round(
+        np.clip(np.random.normal(65 if r["estacao"] == "CHUVOSA" else 45, 15), 20, 100), 1
+    )
+    r["tecnico_id"] = f"TEC-{random.randint(1, 8):03d}"
+    r["escore_locomotor"] = _rng_choice([1, 2, 3, 4, 5], [0.40, 0.30, 0.20, 0.07, 0.03])
+    r["num_inseminacoes_total"] = max(1, r["num_partos_anteriores"] + random.randint(0, 3))
+    r["raca_reprodutor"] = random.choice(["Nelore", "Angus", "Brahman", "Simental", "Gir"])
+    r["dep_peso_desmame"] = round(np.clip(np.random.normal(12.0, 5.0), -5.0, 30.0), 1)
+    r["dep_ganho_pos_desmame"] = round(np.clip(np.random.normal(10.0, 4.0), -5.0, 25.0), 1)
+    r["ciclo_estral_dias"] = ciclo
+    r["resultado_diagnostico_anterior"] = _rng_choice(
+        ["PRENHA", "VAZIA", "PRIMEIRA_VEZ"],
+        [0.55 if target == 1 else 0.30, 0.35 if target == 1 else 0.60, 0.10],
+    )
+    r["intervalo_entre_partos_dias"] = (
+        int(np.clip(np.random.normal(380, 40), 280, 600))
+        if r["num_partos_anteriores"] >= 2
+        else None
+    )
+
+    return r
+
+
+def gerar_registros_especie(especie: str, n: int) -> list[dict]:
+    """Gera n registros para uma espécie com a taxa de prenhez alvo."""
+    prob_prenha = PROB_BASE[especie]
+    n_prenha = round(n * prob_prenha)
+    n_vazia = n - n_prenha
+
+    registros = (
+        [_gerar_registro(especie, 1) for _ in range(n_prenha)]
+        + [_gerar_registro(especie, 0) for _ in range(n_vazia)]
+    )
+    # Embaralha para que treino/teste não vejam padrões de posição
+    random.shuffle(registros)
     return registros
 
 
@@ -286,22 +268,11 @@ def main() -> None:
 
     df = pd.DataFrame(registros)
 
-    # Ordem das colunas: 14 features ML | extras motor de regras | auxiliares | target
     features_ml = [
-        "condicao_corporal",
-        "historico_taxa_prenhez",
-        "intervalo_pos_parto_dias",
-        "num_partos_anteriores",
-        "dias_desde_ultima_ins",
-        "dep_fertilidade_animal",
-        "especie",
-        "raca_femea",
-        "tipo_inseminacao",
-        "protocolo_hormonal",
-        "temperatura_ambiente_c",
-        "estacao",
-        "dep_acuracia",
-        "coeficiente_endogamia",
+        "condicao_corporal", "historico_taxa_prenhez", "intervalo_pos_parto_dias",
+        "num_partos_anteriores", "dias_desde_ultima_ins", "dep_fertilidade_animal",
+        "especie", "raca_femea", "tipo_inseminacao", "protocolo_hormonal",
+        "temperatura_ambiente_c", "estacao", "dep_acuracia", "coeficiente_endogamia",
     ]
     extras_regras = ["ciclos_sem_concepcao", "dep_fertilidade_reprodutor", "heterose_esperada"]
     auxiliares = [
@@ -315,17 +286,15 @@ def main() -> None:
     output_path = os.path.join(os.path.dirname(__file__), "cold_start_v1.csv")
     df.to_csv(output_path, index=False)
 
-    # Estatísticas de validação
     taxa_geral = df["prenha"].mean()
     print(f"Registros gerados: {len(df)}")
     print(f"Taxa de prenhez geral: {taxa_geral:.3f} (alvo ~0.62)")
     for esp in ["BOVINO", "OVINO", "CAPRINO"]:
         sub = df[df["especie"] == esp]
-        print(f"  {esp}: {len(sub)} registros, taxa prenhez = {sub['prenha'].mean():.3f} (alvo {PROB_BASE[esp]:.2f})")
+        print(f"  {esp}: {len(sub)} registros, taxa = {sub['prenha'].mean():.3f}")
 
     sha256 = hashlib.sha256(open(output_path, "rb").read()).hexdigest()
-    print(f"\nArquivo: {output_path}")
-    print(f"SHA-256: {sha256}")
+    print(f"\nArquivo: {output_path}\nSHA-256: {sha256}")
     print(f"Colunas: {len(df.columns)} ({len(features_ml)} ML + {len(extras_regras)} regras + {len(auxiliares)} aux + 1 target)")
 
 
