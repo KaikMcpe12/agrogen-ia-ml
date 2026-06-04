@@ -1,5 +1,4 @@
 models/
-data/
 notebooks/
 .pytest_cache/
 __pycache__/
@@ -9,3 +8,6 @@ __pycache__/
 .gitignore
 tests/
 README.md
+# Exclui o CSV gerado (a imagem gera o próprio durante o build)
+data/cold_start_v1.csv
+data/cold_start_sintetico.csv
